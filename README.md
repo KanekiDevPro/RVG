@@ -21,7 +21,7 @@
 ابتدا روی دکمه **Fork** کلیک کنید تا این ریپازیتوری را به حساب خود منتقل کنید:
 
 ```bash
-https://github.com/[your-username]/rvg-gateway-codebox
+https://github.com/[your-username]/rvg
 ```
 
 ---
