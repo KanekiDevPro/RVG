@@ -393,9 +393,16 @@ async def list_links(_=Depends(require_auth)):
     for uid, d in snap.items():
         exp = d.get("expires_at")
         expired = datetime.now() > datetime.fromisoformat(exp) if exp else False
-        vless_link = f"vless://{uid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uid}&sni={host}#RVG-{quote(d['label'])}"
+        
+        remark = quote(d['label'])
+        vless_link = f"vless://{uid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uid}&sni={host}&fp=chrome#vless-WS-{remark}"
+        trojan_link = f"trojan://{uid}@{host}:443?security=tls&type=ws&host={host}&path=%2Fws%2Ftrojan%2F{uid}&sni={host}&fp=chrome#trojan-WS-{remark}"
+        xhttp_link = f"vless://{uid}@{host}:443?encryption=none&security=tls&type=xhttp&host={host}&path=%2Fxhttp%2F{uid}&sni={host}&mode=packet-stream#vless-XHTTP-{remark}"
+        
         result.append({
-            "uuid": uid, **d, "expired": expired, "vless_link": vless_link, "sub_url": f"https://{host}/sub/{uid}"
+            "uuid": uid, **d, "expired": expired, 
+            "vless_link": vless_link, "trojan_link": trojan_link, "xhttp_link": xhttp_link,
+            "sub_url": f"https://{host}/sub/{uuid}"
         })
     return {"links": result}
 
@@ -424,8 +431,15 @@ async def subscription_single(uuid: str):
     if not is_link_allowed_fast(uuid): raise HTTPException(status_code=404)
     host = get_host()
     async with LINKS_LOCK: label = LINKS[uuid]["label"]
-    vless = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uuid}&sni={host}#RVG-{quote(label)}"
-    return Response(content=base64.b64encode(vless.encode()).decode(), media_type="text/plain")
+    remark = quote(label)
+    
+    # تحویل هر ۳ کانفیگ در یک سابسکریپشن کامل
+    vless_ws = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uuid}&sni={host}&fp=chrome#WS-{remark}"
+    trojan_ws = f"trojan://{uuid}@{host}:443?security=tls&type=ws&host={host}&path=%2Fws%2Ftrojan%2F{uuid}&sni={host}&fp=chrome#Trojan-{remark}"
+    vless_xhttp = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=xhttp&host={host}&path=%2Fxhttp%2F{uuid}&sni={host}&mode=packet-stream#XHTTP-{remark}"
+    
+    bundle = f"{vless_ws}\n{trojan_ws}\n{vless_xhttp}"
+    return Response(content=base64.b64encode(bundle.encode()).decode(), media_type="text/plain")
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, token=Depends(require_auth)):
@@ -470,40 +484,7 @@ body{font-family:'Vazirmatn',sans-serif;background:var(--bg);display:flex;align-
 .brand-name{font-size:16px;font-weight:700;color:var(--text)}
 .brand-sub{font-size:11px;color:var(--dim);margin-top:2px}
 h1{font-size:21px;font-weight:700;color:var(--text);margin-bottom:5px;letter-spacing:-.02em}
-.sub{font-size:12px;color:var(--mid);margin-bottom:24px;line-height:1.6}
-.hint{display:flex;align-items:center;gap:10px;background:rgba(59,130,246,0.07);border:1px solid rgba(59,130,246,0.15);border-radius:10px;padding:10px 14px;margin-bottom:20px}
-.hint-label{font-size:11px;color:var(--dim);flex:1}
-.hint-val{font-family:ui-monospace,monospace;font-size:14px;font-weight:700;color:var(--accent);background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.25);padding:3px 11px;border-radius:7px;cursor:pointer;transition:.15s;letter-spacing:.08em}
-.hint-val:hover{background:rgba(59,130,246,0.22)}
-.field{margin-bottom:18px}
-.field label{display:block;font-size:10.5px;font-weight:600;color:var(--mid);margin-bottom:7px;text-transform:uppercase;letter-spacing:.06em}
-.inp-wrap{position:relative}
-input[type=password]{width:100%;padding:13px 44px 13px 16px;border-radius:11px;border:1px solid var(--border);background:rgba(0,0,0,.3);color:var(--text);font-family:inherit;font-size:14px;outline:none;transition:.2s}
-input[type=password]:focus{border-color:rgba(59,130,246,.55);background:rgba(0,0,0,.4);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
-.ic{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:18px;pointer-events:none;transition:.2s}
-input:focus+.ic{color:var(--accent)}
-.err{display:none;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#F87171;align-items:center;gap:8px}
-.err.show{display:flex}
-.btn{width:100%;padding:13px;border-radius:11px;border:none;cursor:pointer;background:linear-gradient(135deg,#2563EB,#1D4ED8);color:#fff;font-family:inherit;font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 20px rgba(37,99,235,.4);transition:.2s;position:relative;overflow:hidden}
-.btn::before{content:'';position:absolute;inset:0;background:rgba(255,255,255,.08);opacity:0;transition:.2s}
-.btn:hover::before{opacity:1}
-.btn:disabled{opacity:.5;cursor:not-allowed}
-.footer{margin-top:22px;padding-top:18px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:center;gap:8px;font-size:11px;color:var(--dim)}
-.footer a{color:var(--accent);font-weight:600;text-decoration:none;display:flex;align-items:center;gap:4px}
-@keyframes spin{to{transform:rotate(360deg)}}
-</style>
-</head>
-<body>
-<div class="bg"></div><div class="grid"></div>
-<div class="orb o1"></div><div class="orb o2"></div>
-<div class="wrap">
-  <div class="card">
-    <div class="brand">
-      <div class="brand-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox"></div>
-      <div><div class="brand-name">codebox</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
-    </div>
-    <h1>ورود به پنل</h1>
-    <p class="sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
+.sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
     <div class="err" id="err"><i class="ti ti-alert-circle"></i><span id="err-text"></span></div>
     <div class="hint">
       <span class="hint-label">رمز پیش‌فرض سیستم</span>
@@ -553,7 +534,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
   --bg:#060f1d;--bg2:#0a1628;--bg3:#0e1e35;
-  --card:#0d1b2e;--card-b:rgba(59,130,246,0.13);--card-bh:rgba(59,130,246,0.28);
+  --card:#0d1b2e;--card-b:rgba(59,130,246,0.13);--card-b:rgba(59,130,246,0.28);
   --accent:#3B82F6;--accent2:#60A5FA;--accent-d:rgba(59,130,246,0.12);
   --green:#10B981;--green-bg:rgba(16,185,129,0.1);--green-t:#34D399;
   --red:#EF4444;--red-bg:rgba(239,68,68,0.1);--red-t:#F87171;
@@ -853,7 +834,7 @@ a{color:inherit;text-decoration:none}
     <div class="card-title"><i class="ti ti-list"></i> لینک‌ها</div>
     <div style="overflow-x:auto">
       <table class="tbl">
-        <thead><tr><th>عنوان / یادداشت</th><th>UUID / کلید</th><th>مصرف / سهمیه</th><th>انقضا</th><th>وضعیت</th><th>عملیات</th></tr></thead>
+        <thead><tr><th>عنوان / یادداشت</th><th>UUID / کلید</th><th>مصرف / سهمیه</th><th>انقضا</th><th>وضعیت</th><th>دانلود کانفیگ اختصاصی</th></tr></thead>
         <tbody id="links-tb"></tbody>
       </table>
     </div>
@@ -951,7 +932,7 @@ function toast(msg,type=''){
   t.textContent=msg;t.className='toast show'+(type?' '+type:'');
   setTimeout(()=>t.classList.remove('show'),2400);
 }
-function fmtB(b){if(!b||b===0)return '0 B';if(b<1024)return b+' B';if(b<1024**2)return (b/1024).toFixed(1)+' KB';if(b<1024**3)return (b/1024**2).toFixed(2)+' MB';return (b/1024**3).toFixed(2)+' GB'}
+function fmtB(b){if(!b||b===0)return '0 B';if(b<1024)return b+' B';if(b<1024**2)return (b/1024).toFixed(1)+' KB';if(b<1024**2)return (b/1024**2).toFixed(2)+' MB';return (b/1024**3).toFixed(2)+' GB'}
 function toFa(n){return n.toString().replace(/\d/g,d=>'۰۱۲۳۴۵۶۷۸۹'[d])}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&','<':'<','>':'>','"':'"',"'":''}[c]))}
 function daysLeft(exp){if(!exp)return null;return Math.ceil((new Date(exp)-new Date())/(864e5))}
@@ -1052,8 +1033,11 @@ async function loadLinks(){
         <td><div style="width:120px"><div class="ubar"><div class="ubar-f" style="width:${pct}%;background:${bc}"></div></div><div class="utxt">${fmtB(l.used_bytes)} / ${lim}</div></div></td>
         <td>${expChip(l.expires_at,l.expired)}</td>
         <td><button class="tog${allowed?' on':''}" onclick="toggleActive('${l.uuid}',${!l.active})"></button></td>
-        <td><div style="display:flex;gap:4px;flex-wrap:nowrap">
-          <button class="btn btn-sm btn-g" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('کپی شد','ok'))"><i class="ti ti-copy"></i></button>
+        <td><div style="display:flex;gap:6px;flex-wrap:nowrap">
+          <button class="btn btn-sm btn-p" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک VLESS-WS کپی شد','ok'))" title="کپی VLESS WS">VLESS</button>
+          <button class="btn btn-sm btn-g" style="background:#10B981;color:white" onclick="navigator.clipboard.writeText('${esc(l.trojan_link)}').then(()=>toast('لینک Trojan-WS کپی شد','ok'))" title="کپی Trojan WS">Trojan</button>
+          <button class="btn btn-sm btn-o" style="background:#F59E0B;color:white" onclick="navigator.clipboard.writeText('${esc(l.xhttp_link)}').then(()=>toast('لینک XHTTP کپی شد','ok'))" title="کپی VLESS XHTTP">XHTTP</button>
+          <button class="btn btn-sm btn-g" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('لینک سابسکریپشن کپی شد','ok'))" title="کپی Sub URL"><i class="ti ti-rss"></i></button>
           <button class="btn btn-sm btn-d" onclick="deleteLink('${l.uuid}')"><i class="ti ti-trash"></i></button>
         </div></td>
       </tr>`;
@@ -1097,7 +1081,7 @@ function initCharts(){
   const ds={label:'MB',data:[],borderColor:'rgba(59,130,246,.8)',backgroundColor:'rgba(59,130,246,.05)',fill:true,tension:.45,borderWidth:2};
   ch1=new Chart(document.getElementById('ch1'),{type:'line',data:{labels:[],datasets:[{...ds}]},options:opts});
   ch3=new Chart(document.getElementById('ch3'),{type:'line',data:{labels:[],datasets:[{...ds}]},options:opts});
-  ch2=new Chart(document.getElementById('ch2'),{type:'doughnut',data:{labels:['VLESS','Trojan','XHTTP'],datasets:[{data:[60,30,10],backgroundColor:['rgba(59,130,246,.8)','rgba(16,185,129,.7)','rgba(139,92,246,.7)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%'}});
+  ch2=new Chart(document.getElementById('ch2'),{type:'doughnut',data:{labels:['VLESS','Trojan','XHTTP'],datasets:[{data:[50,30,20],backgroundColor:['rgba(59,130,246,.8)','rgba(16,185,129,.7)','rgba(139,92,246,.7)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%'}});
 }
 
 document.addEventListener('DOMContentLoaded',async()=>{
