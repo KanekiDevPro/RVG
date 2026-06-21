@@ -4,7 +4,7 @@ import os
 import hashlib
 import secrets
 import time
-import base64
+import aiofiles
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -13,12 +13,14 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import httpx
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("RVG-Core-Gateway")
+logger = logging.getLogger("RVG-Gateway")
 
-app = FastAPI(title="RVG Advanced Gateway", docs_url=None, redoc_url=None)
+app = FastAPI(title="RVG Gateway – codebox", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
@@ -34,28 +36,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── لایه پایدارسازی داده و بافر هوشمند ─────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
-DATA_FILE = DATA_DIR / "rvg_state_v9.json"
+# ── Persistence ──────────────────────────────────────────────────────────────
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_FILE = DATA_DIR / "rvg_state.json"
 SAVE_LOCK = asyncio.Lock()
 
-LINKS: dict = {}
-LINKS_LOCK = asyncio.Lock()
+async def load_state():
+    global LINKS, AUTH
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if DATA_FILE.exists():
+            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
+                raw = await f.read()
+            data = json.loads(raw)
+            LINKS.update(data.get("links", {}))
+            if "password_hash" in data:
+                AUTH["password_hash"] = data["password_hash"]
+            logger.info(f"✅ State loaded: {len(LINKS)} links")
+    except Exception as e:
+        logger.warning(f"Could not load state: {e}")
 
-TRAFFIC_BUFFER = defaultdict(int)
-ACTIVE_CONNS_BY_UUID = defaultdict(set) 
-WS_TRACKER = {} 
+async def save_state():
+    async with SAVE_LOCK:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            data = {
+                "links": dict(LINKS),
+                "password_hash": AUTH["password_hash"],
+                "saved_at": datetime.now().isoformat(),
+            }
+            tmp = DATA_FILE.with_suffix(".tmp")
+            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            tmp.replace(DATA_FILE)
+        except Exception as e:
+            logger.warning(f"Could not save state: {e}")
 
+# ── In-memory state ──────────────────────────────────────────────────────────
+connections: dict = {}
 stats = {
     "total_bytes": 0,
     "total_requests": 0,
     "total_errors": 0,
     "start_time": time.time(),
 }
-error_logs = deque(maxlen=50)
-hourly_traffic = defaultdict(int)
-RELAY_BUF = 256 * 1024  
+error_logs: deque = deque(maxlen=50)
+hourly_traffic: dict = defaultdict(int)
+http_client: httpx.AsyncClient | None = None
+LINKS: dict = {}
+LINKS_LOCK = asyncio.Lock()
 
+# ── Auth ─────────────────────────────────────────────────────────────────────
 SESSION_COOKIE = "rvg_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 
@@ -66,7 +97,6 @@ AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
-# ── مدیریت سشن‌ها ───────────────────────────────────────────────────────────
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
@@ -74,17 +104,20 @@ async def create_session() -> str:
     return token
 
 async def is_valid_session(token: str | None) -> bool:
-    if not token: return False
+    if not token:
+        return False
     async with SESSIONS_LOCK:
         exp = SESSIONS.get(token)
-        if exp is None: return False
+        if exp is None:
+            return False
         if exp < time.time():
             SESSIONS.pop(token, None)
             return False
         return True
 
 async def destroy_session(token: str | None):
-    if not token: return
+    if not token:
+        return
     async with SESSIONS_LOCK:
         SESSIONS.pop(token, None)
 
@@ -94,230 +127,51 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ── مدیریت دیتابیس و ذخیره‌سازی خودکار ────────────────────────────────────────
-async def load_state():
-    global LINKS, AUTH
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if DATA_FILE.exists():
-            import aiofiles
-            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
-                raw = await f.read()
-            data = json.loads(raw)
-            async with LINKS_LOCK:
-                LINKS.update(data.get("links", {}))
-            if "password_hash" in data:
-                AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"✅ دیتابیس بارگذاری شد: {len(LINKS)} اکانت.")
-    except Exception as e:
-        logger.error(f"❌ خطا در بارگذاری دیتابیس: {e}")
+# ── Startup / Shutdown ────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    global http_client
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    http_client = httpx.AsyncClient(
+        limits=limits, timeout=timeout, follow_redirects=True,
+    )
+    await load_state()
+    logger.info(f"🚀 RVG Gateway v8.1 started on port {CONFIG['port']}")
 
-async def save_state():
-    async with SAVE_LOCK:
-        try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            async with LINKS_LOCK:
-                data_snapshot = {
-                    "links": dict(LINKS),
-                    "password_hash": AUTH["password_hash"],
-                    "saved_at": datetime.now().isoformat(),
-                }
-            tmp = DATA_FILE.with_suffix(".tmp")
-            import aiofiles
-            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data_snapshot, ensure_ascii=False, indent=2))
-            tmp.replace(DATA_FILE)
-        except Exception as e:
-            logger.warning(f"❌ خطا در ذخیره‌سازی: {e}")
+@app.on_event("shutdown")
+async def shutdown():
+    await save_state()
+    if http_client:
+        await http_client.aclose()
 
-# ── وظیفه پس‌زمینه تخلیه بافر و قطع کاربران متخلف ─────────────────────────────
-async def traffic_flusher_and_killer_loop():
-    while True:
-        await asyncio.sleep(5)
-        if not TRAFFIC_BUFFER:
-            continue
-        
-        uids_to_kill = set()
-        async with LINKS_LOCK:
-            for uid, bytes_used in list(TRAFFIC_BUFFER.items()):
-                if uid in LINKS:
-                    LINKS[uid]["used_bytes"] += bytes_used
-                    stats["total_bytes"] += bytes_used
-                    hourly_traffic[datetime.now().strftime("%H:00")] += bytes_used
-                    
-                    lb = LINKS[uid].get("limit_bytes", 0)
-                    if lb > 0 and LINKS[uid]["used_bytes"] >= lb:
-                        uids_to_kill.add(uid)
-                del TRAFFIC_BUFFER[uid]
-                
-        for uid in uids_to_kill:
-            if uid in ACTIVE_CONNS_BY_UUID:
-                logger.info(f"🚨 اکانت [{uid[:8]}] ترافیک تمام کرد. قطع آنی...")
-                for conn_id in list(ACTIVE_CONNS_BY_UUID[uid]):
-                    ws_obj = WS_TRACKER.get(conn_id)
-                    if ws_obj:
-                        try: await ws_obj.close(code=1008, reason="quota_exhausted")
-                        except Exception: pass
-                        WS_TRACKER.pop(conn_id, None)
-                    ACTIVE_CONNS_BY_UUID[uid].discard(conn_id)
-        
-        asyncio.create_task(save_state())
-
-# ── پارسرهای هدر پروتکل‌ها ─────────────────────────────────────────────────────
-async def parse_vless_header(chunk: bytes):
-    if len(chunk) < 24: raise ValueError("VLESS packet too small")
-    pos = 1
-    pos += 16
-    addon_len = chunk[pos]; pos += 1 + addon_len
-    command = chunk[pos]; pos += 1
-    port = int.from_bytes(chunk[pos:pos+2], "big"); pos += 2
-    addr_type = chunk[pos]; pos += 1
-    if addr_type == 1:
-        address = ".".join(str(b) for b in chunk[pos:pos+4]); pos += 4
-    elif addr_type == 2:
-        dlen = chunk[pos]; pos += 1
-        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore"); pos += dlen
-    elif addr_type == 3:
-        ab = chunk[pos:pos+16]; pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
-    else: raise ValueError(f"Unknown addr type: {addr_type}")
-    return command, address, port, chunk[pos:]
-
-async def parse_trojan_header(chunk: bytes):
-    if len(chunk) < 60: raise ValueError("Trojan packet too small")
-    password_hash = chunk[:56].decode('utf-8', errors='ignore')
-    pos = 56 + 2
-    command = chunk[pos]; pos += 1
-    addr_type = chunk[pos]; pos += 1
-    if addr_type == 1:
-        address = ".".join(str(b) for b in chunk[pos:pos+4]); pos += 4
-    elif addr_type == 2:
-        dlen = chunk[pos]; pos += 1
-        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore"); pos += dlen
-    elif addr_type == 3:
-        ab = chunk[pos:pos+16]; pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
-    else: raise ValueError("Unknown Trojan addr type")
-    port = int.from_bytes(chunk[pos:pos+2], "big"); pos += 2
-    return password_hash, command, address, port, chunk[pos:]
-
-def is_link_allowed_fast(uid: str) -> bool:
-    link = LINKS.get(uid)
-    if not link or not link.get("active", True): return False
-    exp = link.get("expires_at")
-    if exp and datetime.now() > datetime.fromisoformat(exp): return False
-    lb = link.get("limit_bytes", 0)
-    if lb > 0 and link.get("used_bytes", 0) >= lb: return False
-    return True
-
-# ── رله دوطرفه کلاینت و مقصد ──────────────────────────────────────────────────
-async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, uid: str):
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect": break
-            data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data: continue
-            if not is_link_allowed_fast(uid): break
-            TRAFFIC_BUFFER[uid] += len(data)
-            stats["total_requests"] += 1
-            writer.write(data)
-            if writer.transport.get_write_buffer_size() > RELAY_BUF:
-                await writer.drain()
-    except Exception: pass
-
-async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, uid: str, proto: str = "vless"):
-    first = True
-    try:
-        while True:
-            data = await reader.read(RELAY_BUF)
-            if not data: break
-            if not is_link_allowed_fast(uid): break
-            TRAFFIC_BUFFER[uid] += len(data)
-            payload = (b"\x00\x00" + data) if (first and proto == "vless") else data
-            first = False
-            await ws.send_bytes(payload)
-    except Exception: pass
-
-# ── 🌐 WebSocket چند پروتکله (VLESS & Trojan) ─────────────────────────────────
-@app.websocket("/ws/{proto}/{uuid}")
-async def advanced_multiprotocol_tunnel(ws: WebSocket, proto: str, uuid: str):
-    if proto not in ["vless", "trojan"]:
-        await ws.close(code=1003)
-        return
-    await ws.accept()
-    if not is_link_allowed_fast(uuid):
-        await ws.close(code=1008)
-        return
-
-    conn_id = secrets.token_urlsafe(8)
-    ACTIVE_CONNS_BY_UUID[uuid].add(conn_id)
-    WS_TRACKER[conn_id] = ws
-    writer = None
-
-    try:
-        first_msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk: return
-
-        if proto == "vless":
-            command, address, port, payload = await parse_vless_header(first_chunk)
-        else:
-            _, command, address, port, payload = await parse_trojan_header(first_chunk)
-
-        TRAFFIC_BUFFER[uuid] += len(first_chunk)
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=7.0)
-        sock = writer.transport.get_extra_info('socket')
-        if sock:
-            import socket
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        if payload: writer.write(payload)
-
-        await asyncio.gather(
-            relay_ws_to_tcp(ws, writer, uuid),
-            relay_tcp_to_ws(ws, reader, uuid, proto=proto),
-            return_exceptions=True
-        )
-    except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception: pass
-        ACTIVE_CONNS_BY_UUID[uuid].discard(conn_id)
-        WS_TRACKER.pop(conn_id, None)
-
-# ── 🔥 لایه اختصاصی VLESS-XHTTP-TLS ──────────────────────────────────────────
-@app.post("/xhttp/{uuid}")
-async def vless_xhttp_endpoint(uuid: str, request: Request):
-    if not is_link_allowed_fast(uuid):
-        raise HTTPException(status_code=403, detail="Inactive")
-    body_bytes = await request.body()
-    if not body_bytes: return Response(status_code=200)
-    try:
-        command, address, port, payload = await parse_vless_header(body_bytes)
-        TRAFFIC_BUFFER[uuid] += len(body_bytes)
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=5.0)
-        if payload:
-            writer.write(payload)
-            await writer.drain()
-        response_chunk = await reader.read(RELAY_BUF)
-        final_response = b"\x00\x00" + response_chunk
-        TRAFFIC_BUFFER[uuid] += len(response_chunk)
-        writer.close()
-        await writer.wait_closed()
-        return Response(content=final_response, media_type="application/octet-stream")
-    except Exception as e:
-        stats["total_errors"] += 1
-        raise HTTPException(status_code=502, detail=str(e))
-
-# ── APIهای مدیریت لینک و سابسکریپشن ───────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def get_host() -> str:
     return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
+
+def generate_uuid() -> str:
+    h = secrets.token_hex(16)
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+def generate_vless_link(uuid: str, host: str, remark: str = "RVG") -> str:
+    path = f"/ws/{uuid}"
+    params = {
+        "encryption": "none",
+        "security": "tls",
+        "type": "ws",
+        "host": host,
+        "path": path,
+        "sni": host,
+        "fp": "chrome",
+        "alpn": "http/1.1",
+    }
+    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
+
+def uptime() -> str:
+    secs = int(time.time() - stats["start_time"])
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def parse_size_to_bytes(value: float, unit: str) -> int:
     unit = unit.upper()
@@ -326,6 +180,93 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
     if unit == "KB": return int(value * 1024)
     return int(value)
 
+def is_link_expired(link: dict) -> bool:
+    exp = link.get("expires_at")
+    if not exp:
+        return False
+    try:
+        return datetime.now() > datetime.fromisoformat(exp)
+    except Exception:
+        return False
+
+def is_link_allowed(link: dict | None) -> bool:
+    """
+    ✅ FIX: اگه link وجود نداشته باشه → رد کن (قبلاً True برمیگشت!)
+    True فقط اگه لینک موجود، فعال، منقضی‌نشده و در سهمیه باشه
+    """
+    if link is None:
+        return False  # ← FIX: UUID ناشناس رد میشه
+    if not link.get("active", True):
+        return False
+    if is_link_expired(link):
+        return False
+    lb = link.get("limit_bytes", 0)
+    if lb > 0 and link.get("used_bytes", 0) >= lb:
+        return False
+    return True
+
+# ── Default link ──────────────────────────────────────────────────────────────
+_default_link_created = False
+
+async def ensure_default_link():
+    global _default_link_created
+    if _default_link_created:
+        return
+    async with LINKS_LOCK:
+        if not any(l.get("is_default") for l in LINKS.values()):
+            uid = hashlib.sha256(f"default{CONFIG['secret']}".encode()).hexdigest()
+            uid = f"{uid[:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
+            if uid not in LINKS:
+                LINKS[uid] = {
+                    "label": "لینک پیش‌فرض",
+                    "limit_bytes": 0,
+                    "used_bytes": 0,
+                    "created_at": datetime.now().isoformat(),
+                    "active": True,
+                    "expires_at": None,
+                    "note": "",
+                    "is_default": True,
+                }
+                asyncio.create_task(save_state())
+        _default_link_created = True
+
+# ── Basic endpoints ───────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {"service": "RVG Gateway", "version": "8.2", "status": "active", "channel": "https://t.me/CodeBoxo"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+
+# ── Subscription ──────────────────────────────────────────────────────────────
+@app.get("/sub/{uuid}")
+async def subscription_single(uuid: str):
+    import base64
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not link or not is_link_allowed(link):
+        raise HTTPException(status_code=404, detail="not found or inactive")
+    host = get_host()
+    vless = generate_vless_link(uuid, host, remark=f"RVG-{link['label']}")
+    content = base64.b64encode(vless.encode()).decode()
+    return Response(content=content, media_type="text/plain",
+                    headers={"profile-title": link["label"], "support-url": "https://t.me/CodeBoxo"})
+
+@app.get("/sub-all")
+async def subscription_all(_=Depends(require_auth)):
+    import base64
+    host = get_host()
+    async with LINKS_LOCK:
+        lines = [
+            generate_vless_link(uid, host, remark=f"RVG-{d['label']}")
+            for uid, d in LINKS.items()
+            if is_link_allowed(d)
+        ]
+    content = base64.b64encode("\n".join(lines).encode()).decode()
+    return Response(content=content, media_type="text/plain")
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
 @app.post("/api/login")
 async def api_login(request: Request):
     body = await request.json()
@@ -347,23 +288,41 @@ async def api_logout(request: Request):
 async def api_me(request: Request):
     return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
 
+@app.post("/api/change-password")
+async def api_change_password(request: Request, token=Depends(require_auth)):
+    body = await request.json()
+    if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
+        raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
+    new = str(body.get("new_password", ""))
+    if len(new) < 4:
+        raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
+    AUTH["password_hash"] = hash_password(new)
+    async with SESSIONS_LOCK:
+        SESSIONS.clear()
+        SESSIONS[token] = time.time() + SESSION_TTL
+    await save_state()
+    return {"ok": True}
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
-    active_count = sum(len(conns) for conns in ACTIVE_CONNS_BY_UUID.values())
-    async with LINKS_LOCK: snap = dict(LINKS)
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
     return {
-        "active_connections": active_count,
+        "active_connections": len(connections),
         "total_traffic_mb": round(stats["total_bytes"] / (1024 ** 2), 2),
         "total_requests": stats["total_requests"],
         "total_errors": stats["total_errors"],
-        "uptime": f"{int(time.time() - stats['start_time']) // 3600:02d}:{(int(time.time() - stats['start_time']) % 3600) // 60:02d}:{int(time.time() - stats['start_time']) % 60:02d}",
+        "uptime": uptime(),
         "timestamp": datetime.now().isoformat(),
         "hourly": dict(hourly_traffic),
         "recent_errors": list(error_logs)[-10:],
         "links_count": len(snap),
-        "active_links": sum(1 for l in snap.values() if is_link_allowed_fast(l)),
+        "active_links": sum(1 for l in snap.values() if is_link_allowed(l)),
+        "expired_links": sum(1 for l in snap.values() if is_link_expired(l)),
     }
 
+# ── Link Management ───────────────────────────────────────────────────────────
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
@@ -373,89 +332,291 @@ async def create_link(request: Request, _=Depends(require_auth)):
     limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
     exp_days = int(body.get("expires_days") or 0)
     expires_at = (datetime.now() + timedelta(days=exp_days)).isoformat() if exp_days > 0 else None
-    
-    h = secrets.token_hex(16)
-    uid = f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
-    
+    note = (body.get("note") or "").strip()[:200]
+
+    uid = generate_uuid()
     async with LINKS_LOCK:
         LINKS[uid] = {
-            "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
-            "created_at": datetime.now().isoformat(), "active": True,
-            "expires_at": expires_at, "note": (body.get("note") or "")[:200], "is_default": False
+            "label": label,
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "created_at": datetime.now().isoformat(),
+            "active": True,
+            "expires_at": expires_at,
+            "note": note,
+            "is_default": False,
         }
     asyncio.create_task(save_state())
-    return {"uuid": uid, **LINKS[uid]}
+    host = get_host()
+    return {
+        "uuid": uid,
+        **LINKS[uid],
+        "expired": False,
+        "vless_link": generate_vless_link(uid, host, remark=f"RVG-{label}"),
+        "sub_url": f"https://{host}/sub/{uid}",
+    }
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     host = get_host()
-    async with LINKS_LOCK: snap = dict(LINKS)
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
     result = []
     for uid, d in snap.items():
-        exp = d.get("expires_at")
-        expired = datetime.now() > datetime.fromisoformat(exp) if exp else False
-        
-        remark = quote(d['label'])
-        vless_link = f"vless://{uid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uid}&sni={host}&fp=chrome#vless-WS-{remark}"
-        trojan_link = f"trojan://{uid}@{host}:443?security=tls&type=ws&host={host}&path=%2Fws%2Ftrojan%2F{uid}&sni={host}&fp=chrome#trojan-WS-{remark}"
-        xhttp_link = f"vless://{uid}@{host}:443?encryption=none&security=tls&type=xhttp&host={host}&path=%2Fxhttp%2F{uid}&sni={host}&mode=packet-stream#vless-XHTTP-{remark}"
-        
         result.append({
-            "uuid": uid, **d, "expired": expired, 
-            "vless_link": vless_link, "trojan_link": trojan_link, "xhttp_link": xhttp_link,
-            "sub_url": f"https://{host}/sub/{uid}"
+            "uuid": uid,
+            **d,
+            "expired": is_link_expired(d),
+            "vless_link": generate_vless_link(uid, host, remark=f"RVG-{d['label']}"),
+            "sub_url": f"https://{host}/sub/{uid}",
         })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
 @app.patch("/api/links/{uid}")
 async def update_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
-        if uid not in LINKS: raise HTTPException(status_code=404)
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
         link = LINKS[uid]
-        if "active" in body: link["active"] = bool(body["active"])
-        if "label" in body: link["label"] = str(body["label"])[:60]
-        if "note" in body: link["note"] = str(body["note"])[:200]
-        if "reset_usage" in body and body["reset_usage"]: link["used_bytes"] = 0
+        if "active" in body:
+            link["active"] = bool(body["active"])
+        if "label" in body:
+            link["label"] = str(body["label"])[:60]
+        if "note" in body:
+            link["note"] = str(body["note"])[:200]
+        if "reset_usage" in body and body["reset_usage"]:
+            link["used_bytes"] = 0
+        if "limit_value" in body:
+            lv = float(body.get("limit_value") or 0)
+            lu = body.get("limit_unit") or "GB"
+            link["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+        if "expires_days" in body:
+            ed = int(body["expires_days"] or 0)
+            link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
     asyncio.create_task(save_state())
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
-        if uid in LINKS: del LINKS[uid]
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        del LINKS[uid]
     asyncio.create_task(save_state())
-    return {"ok": True}
+    return {"ok": True, "deleted": uid}
 
-@app.get("/sub/{uuid}")
-async def subscription_single(uuid: str):
-    if not is_link_allowed_fast(uuid): raise HTTPException(status_code=404)
-    host = get_host()
-    async with LINKS_LOCK: label = LINKS[uuid]["label"]
-    remark = quote(label)
-    
-    vless_ws = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uuid}&sni={host}&fp=chrome#WS-{remark}"
-    trojan_ws = f"trojan://{uuid}@{host}:443?security=tls&type=ws&host={host}&path=%2Fws%2Ftrojan%2F{uuid}&sni={host}&fp=chrome#Trojan-{remark}"
-    vless_xhttp = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=xhttp&host={host}&path=%2Fxhttp%2F{uuid}&sni={host}&mode=packet-stream#XHTTP-{remark}"
-    
-    bundle = f"{vless_ws}\n{trojan_ws}\n{vless_xhttp}"
-    return Response(content=base64.b64encode(bundle.encode()).decode(), media_type="text/plain")
+# ══════════════════════════════════════════════════════════════════════════════
+# VLESS Relay — بهینه‌شده برای حداکثر throughput
+# ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/api/change-password")
-async def api_change_password(request: Request, token=Depends(require_auth)):
-    body = await request.json()
-    if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
-        raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
-    new = str(body.get("new_password", ""))
-    if len(new) < 4: raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
-    AUTH["password_hash"] = hash_password(new)
-    async with SESSIONS_LOCK:
-        SESSIONS.clear()
-        SESSIONS[token] = time.time() + SESSION_TTL
-    await save_state()
-    return {"ok": True}
+# بافر 256KB برای throughput بالاتر
+RELAY_BUF = 256 * 1024
 
-# ── صفحات وب (HTML) ─────────────────────────────────────────────────────────
+async def parse_vless_header(chunk: bytes):
+    if len(chunk) < 24:
+        raise ValueError("chunk too small")
+    pos = 1  # skip version
+    pos += 16  # skip uuid bytes
+    addon_len = chunk[pos]; pos += 1 + addon_len
+    command = chunk[pos]; pos += 1
+    port = int.from_bytes(chunk[pos:pos+2], "big"); pos += 2
+    addr_type = chunk[pos]; pos += 1
+    if addr_type == 1:
+        address = ".".join(str(b) for b in chunk[pos:pos+4]); pos += 4
+    elif addr_type == 2:
+        dlen = chunk[pos]; pos += 1
+        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore"); pos += dlen
+    elif addr_type == 3:
+        ab = chunk[pos:pos+16]; pos += 16
+        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+    else:
+        raise ValueError(f"unknown addr type: {addr_type}")
+    return command, address, port, chunk[pos:]
+
+async def check_and_use(uid: str, n: int) -> bool:
+    """
+    ✅ FIX: UUID ناشناس → رد کن (قبلاً True برمیگشت!)
+    چک کوتا + فعال/منقضی بودن لینک
+    """
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        # ← FIX: اگه لینک وجود نداشته باشه رد کن
+        if link is None:
+            return False
+        if not is_link_allowed(link):
+            return False
+        link["used_bytes"] += n
+        stats["total_bytes"] += n
+        hourly_traffic[datetime.now().strftime("%H:00")] += n
+    return True
+
+# ── Relay بهینه: بدون await drain در هر بسته ────────────────────────────────
+
+async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
+    """WebSocket → TCP با بافر جمع‌شده برای کاهش سربار"""
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            data = msg.get("bytes") or (msg.get("text") or "").encode()
+            if not data:
+                continue
+            # ✅ FIX: چک میکنه لینک هنوز فعاله
+            if not await check_and_use(uid, len(data)):
+                await ws.close(code=1008, reason="quota/disabled/unknown")
+                break
+            stats["total_requests"] += 1
+            connections[conn_id]["bytes"] += len(data)
+            writer.write(data)
+            # drain فقط وقتی بافر پر باشه → کمتر سربار
+            if writer.transport.get_write_buffer_size() > RELAY_BUF:
+                await writer.drain()
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        try:
+            writer.write_eof()
+        except Exception:
+            pass
+
+async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: str, uid: str):
+    """TCP → WebSocket با خواندن greedy برای throughput بالاتر"""
+    first = True
+    try:
+        while True:
+            # readany → بلافاصله هر داده‌ای که آماده‌ست برمیگردونه
+            data = await reader.read(RELAY_BUF)
+            if not data:
+                break
+            # ✅ FIX: چک میکنه لینک هنوز فعاله
+            if not await check_and_use(uid, len(data)):
+                await ws.close(code=1008, reason="quota/disabled/unknown")
+                break
+            connections[conn_id]["bytes"] += len(data)
+            # هدر VLESS response فقط برای اولین پکت
+            payload = (b"\x00\x00" + data) if first else data
+            first = False
+            await ws.send_bytes(payload)
+    except Exception:
+        pass
+
+@app.websocket("/ws/{uuid}")
+async def websocket_tunnel(ws: WebSocket, uuid: str):
+    await ws.accept()
+
+    # ✅ FIX: اول چک کن UUID در لینک‌ها هست و مجاز است
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+
+    if not is_link_allowed(link):
+        # UUID ناشناس، حذف‌شده، غیرفعال، منقضی یا تموم‌شده سهمیه
+        logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed)")
+        await ws.close(code=1008, reason="not authorized")
+        return
+
+    conn_id = secrets.token_urlsafe(6)
+    connections[conn_id] = {"uuid": uuid, "connected_at": datetime.now().isoformat(), "bytes": 0}
+    logger.info(f"✅ WS [{conn_id}] uuid={uuid[:8]}… total={len(connections)}")
+    writer = None
+
+    try:
+        first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
+        if first_msg["type"] == "websocket.disconnect":
+            return
+        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+        if not first_chunk:
+            return
+
+        command, address, port, payload = await parse_vless_header(first_chunk)
+
+        # ✅ چک مجدد بعد از دریافت هدر (ممکنه بین accept و اینجا تغییر کرده باشه)
+        if not await check_and_use(uuid, len(first_chunk)):
+            await ws.close(code=1008, reason="quota/disabled")
+            return
+
+        stats["total_requests"] += 1
+        connections[conn_id]["bytes"] += len(first_chunk)
+        logger.info(f"➡️  [{conn_id}] → {address}:{port}")
+
+        # TCP با TCP_NODELAY برای کاهش تأخیر
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port),
+            timeout=10.0
+        )
+        # فعال‌سازی TCP_NODELAY → کاهش latency
+        sock = writer.transport.get_extra_info('socket')
+        if sock:
+            import socket
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        if payload:
+            writer.write(payload)
+            await writer.drain()
+
+        # هر دو relay موازی، اولی که تموم شد بقیه هم cancel
+        done, pending = await asyncio.wait(
+            {
+                asyncio.create_task(relay_ws_to_tcp(ws, writer, conn_id, uuid)),
+                asyncio.create_task(relay_tcp_to_ws(ws, reader, conn_id, uuid)),
+            },
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.create_task(save_state())
+
+    except WebSocketDisconnect:
+        pass
+    except asyncio.TimeoutError:
+        stats["total_errors"] += 1
+        error_logs.append({"error": "connection timeout", "time": datetime.now().isoformat()})
+    except Exception as exc:
+        stats["total_errors"] += 1
+        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
+        logger.error(f"WS error [{conn_id}]: {exc}")
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+        connections.pop(conn_id, None)
+        logger.info(f"🔌 WS closed [{conn_id}] total={len(connections)}")
+
+# ── HTTP Proxy ────────────────────────────────────────────────────────────────
+_HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
+        "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
+
+@app.api_route("/proxy/{target_url:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
+async def http_proxy(target_url: str, request: Request):
+    if not target_url.startswith("http"):
+        target_url = "https://" + target_url
+    try:
+        body = await request.body()
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP and k.lower() != "host"}
+        resp = await http_client.request(method=request.method, url=target_url, headers=headers, content=body)
+        stats["total_bytes"] += len(resp.content)
+        stats["total_requests"] += 1
+        hourly_traffic[datetime.now().strftime("%H:00")] += len(resp.content)
+        return Response(content=resp.content, status_code=resp.status_code,
+                        headers={k: v for k, v in resp.headers.items() if k.lower() not in _HOP})
+    except Exception as exc:
+        stats["total_errors"] += 1
+        error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
+        raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML Pages
+# ══════════════════════════════════════════════════════════════════════════════
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -514,7 +675,7 @@ input:focus+.ic{color:var(--accent)}
   <div class="card">
     <div class="brand">
       <div class="brand-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox"></div>
-      <div><div class="brand-name">codebox</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
+      <div><div class="brand-name">codebox</div><div class="brand-sub">RVG Gateway · v8.1</div></div>
     </div>
     <h1>ورود به پنل</h1>
     <p class="sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
@@ -791,7 +952,7 @@ a{color:inherit;text-decoration:none}
   <button class="sb-close" id="close-sb"><i class="ti ti-x"></i></button>
   <div class="logo">
     <div class="logo-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="cb"></div>
-    <div><div class="logo-name">codebox</div><div class="logo-sub">RVG Gateway · v9.0</div></div>
+    <div><div class="logo-name">codebox</div><div class="logo-sub">RVG Gateway · v8.1</div></div>
   </div>
   <div class="nav-wrap">
     <div class="nav-sec">پنل</div>
@@ -799,10 +960,12 @@ a{color:inherit;text-decoration:none}
     <div class="nav-it" data-pg="links"><i class="ti ti-link-plus"></i> مدیریت لینک‌ها <span class="nav-badge" id="links-nb">0</span></div>
     <div class="nav-it" data-pg="subscriptions"><i class="ti ti-rss"></i> سابسکریپشن</div>
     <div class="nav-it" data-pg="traffic"><i class="ti ti-chart-area"></i> ترافیک</div>
+    <div class="nav-it" data-pg="connections"><i class="ti ti-plug-connected"></i> اتصالات <span class="nav-badge" id="conns-nb">0</span></div>
     <div class="nav-sec">سیستم</div>
     <div class="nav-it" data-pg="security"><i class="ti ti-shield-lock"></i> امنیت</div>
     <div class="nav-it" data-pg="errors"><i class="ti ti-alert-triangle"></i> خطاها</div>
     <div class="nav-it" data-pg="ideas"><i class="ti ti-bulb"></i> ایده‌ها</div>
+    <div class="nav-it" data-pg="testws"><i class="ti ti-wifi"></i> تست WebSocket</div>
     <div class="nav-it" data-pg="settings"><i class="ti ti-settings"></i> تنظیمات</div>
   </div>
   <div class="sb-foot">
@@ -824,10 +987,23 @@ a{color:inherit;text-decoration:none}
     </div>
   </div>
   <div class="metrics">
-    <div class="metric"><div class="m-icon"><i class="ti ti-plug-connected"></i></div><div class="m-label">اتصالات فعال</div><div class="m-val" id="m-conns">—</div><div class="m-sub"><span class="dot dg pulse"></span> زنده</div></div>
+    <div class="metric"><div class="m-icon"><i class="ti ti-plug-connected"></i></div><div class="m-label">اتصالات فعال</div><div class="m-val" id="m-conns">—</div><div class="m-sub"><span class="dot dg pulse"></span> WebSocket زنده</div></div>
     <div class="metric"><div class="m-icon"><i class="ti ti-transfer"></i></div><div class="m-label">کل ترافیک</div><div class="m-val" id="m-traffic">—<span class="m-unit">MB</span></div><div class="m-sub">از راه‌اندازی</div></div>
     <div class="metric suc"><div class="m-icon suc"><i class="ti ti-link"></i></div><div class="m-label">لینک‌های فعال</div><div class="m-val" id="m-alinks">—</div><div class="m-sub" id="m-lsub">از کل</div></div>
     <div class="metric dan"><div class="m-icon dan"><i class="ti ti-alert-circle"></i></div><div class="m-label">خطاها</div><div class="m-val" id="m-errs">—</div><div class="m-sub">ثبت شده</div></div>
+  </div>
+  <div class="vless-box">
+    <div class="vl-header">
+      <div class="vl-title"><i class="ti ti-link"></i> لینک پیش‌فرض (بدون محدودیت)</div>
+      <span class="badge bg-blue"><span class="dot db"></span> TLS 443 · WS</span>
+    </div>
+    <div class="vl-code" id="vless-main">در حال دریافت...</div>
+    <div class="vl-actions">
+      <button class="btn btn-p" onclick="cpText('vless-main')"><i class="ti ti-copy"></i> کپی</button>
+      <button class="btn btn-g" onclick="qrFor('vless-main')"><i class="ti ti-qrcode"></i> QR</button>
+      <button class="btn btn-o" onclick="navTo('links')"><i class="ti ti-link-plus"></i> لینک محدود</button>
+      <button class="btn btn-o" onclick="navTo('subscriptions')"><i class="ti ti-rss"></i> سابسکریپشن</button>
+    </div>
   </div>
   <div class="g3">
     <div class="card"><div class="card-title"><i class="ti ti-chart-area"></i> ترافیک ساعتی (MB)</div><div class="ch"><canvas id="ch1"></canvas></div></div>
@@ -837,14 +1013,23 @@ a{color:inherit;text-decoration:none}
     <div class="card">
       <div class="card-title"><i class="ti ti-activity"></i> وضعیت سرویس</div>
       <div class="sr"><span class="sr-k"><i class="ti ti-shield-check"></i> UUID Auth</span><span class="sr-v" style="color:var(--green-t)">● فعال · سخت‌گیرانه</span></div>
-      <div class="sr"><span class="sr-k"><i class="ti ti-circle-check"></i> VLESS / Trojan / XHTTP</span><span class="sr-v" style="color:var(--green-t)">● فعال v9.0</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-circle-check"></i> VLESS / WS Tunnel</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-circle-check"></i> HTTP Proxy</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-rss"></i> Subscription API</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-clock"></i> آپتایم</span><span class="sr-v" id="uptime-inline">—</span></div>
+      <div class="sr" style="flex-direction:column;align-items:flex-start;gap:4px">
+        <div style="width:100%;display:flex;justify-content:space-between"><span class="sr-k"><i class="ti ti-gauge"></i> بار نسبی</span><span class="sr-v" id="bw-pct">—%</span></div>
+        <div class="spbar" style="width:100%"><div class="spfill" id="bw-bar" style="width:0%"></div></div>
+      </div>
     </div>
     <div class="card">
       <div class="card-title"><i class="ti ti-list"></i> خلاصه لینک‌ها <span class="ml-auto badge bg-blue" id="lsummary-badge">۰</span></div>
       <div id="lsummary">—</div>
     </div>
+  </div>
+  <div class="dash-footer">
+    <span class="df-text">codebox RVG Gateway v8.1 · Railway · 2025</span>
+    <a class="df-link" href="https://t.me/CodeBoxo" target="_blank"><i class="ti ti-brand-telegram"></i> t.me/CodeBoxo</a>
   </div>
 </section>
 
@@ -864,12 +1049,13 @@ a{color:inherit;text-decoration:none}
       <div class="fg" style="flex:1;min-width:130px"><label>یادداشت</label><input class="fi" id="nl-note" placeholder="اختیاری" style="width:100%"></div>
       <button class="btn btn-p" onclick="createLink()"><i class="ti ti-link-plus"></i> ساخت</button>
     </div>
+    <div class="cl"><i class="ti ti-info-circle"></i><span>UUID هر لینک کاملاً رندوم است. فقط UUID‌های ثبت‌شده در سیستم می‌توانند اتصال برقرار کنند.</span></div>
   </div>
   <div class="card">
     <div class="card-title"><i class="ti ti-list"></i> لینک‌ها</div>
     <div style="overflow-x:auto">
       <table class="tbl">
-        <thead><tr><th>عنوان / یادداشت</th><th>UUID / کلید</th><th>مصرف / سهمیه</th><th>انقضا</th><th>وضعیت</th><th>دانلود کانفیگ اختصاصی</th></tr></thead>
+        <thead><tr><th>عنوان / یادداشت</th><th>UUID</th><th>مصرف / سهمیه</th><th>انقضا</th><th>وضعیت</th><th>عملیات</th></tr></thead>
         <tbody id="links-tb"></tbody>
       </table>
     </div>
@@ -883,7 +1069,14 @@ a{color:inherit;text-decoration:none}
   <div class="g2">
     <div class="card">
       <div class="card-title"><i class="ti ti-rss"></i> سابسکریپشن تکی</div>
-      <p style="font-size:11.5px;color:var(--t3);line-height:1.8;margin-bottom:12px">هر لینک URL سابسکریپشن مخصوص به خود دارد که در Hiddify و v2rayNG قابل استفاده است.</p>
+      <p style="font-size:11.5px;color:var(--t3);line-height:1.8;margin-bottom:12px">هر لینک URL سابسکریپشن مخصوص به خود دارد که در Hiddify، Shadowrocket، v2rayN و NekoBox قابل استفاده است.</p>
+      <div class="cl"><i class="ti ti-info-circle"></i><span>آدرس سابسکریپشن هر کانفیگ را از جدول لینک‌ها با کلیک روی آیکون <i class="ti ti-rss"></i> کپی کنید.</span></div>
+    </div>
+    <div class="card">
+      <div class="card-title"><i class="ti ti-database"></i> سابسکریپشن کامل (ادمین)</div>
+      <p style="font-size:11.5px;color:var(--t3);line-height:1.8;margin-bottom:4px">شامل تمام لینک‌های فعال و منقضی‌نشده.</p>
+      <div class="sub-box"><span class="sub-url" id="sub-all-url">در حال دریافت...</span><div style="display:flex;gap:6px"><button class="btn btn-sm btn-g" onclick="cpSubAll()"><i class="ti ti-copy"></i></button><button class="btn btn-sm btn-g" onclick="window.open(location.protocol+'//'+location.host+'/sub-all')"><i class="ti ti-external-link"></i></button></div></div>
+      <div class="cl amber" style="margin-top:11px"><i class="ti ti-alert-triangle"></i><span>این آدرس فقط در مرورگری که به پنل وارد شده کار می‌کند (نیاز به کوکی سشن).</span></div>
     </div>
   </div>
   <div class="card">
@@ -903,6 +1096,12 @@ a{color:inherit;text-decoration:none}
   <div class="card"><div class="card-title"><i class="ti ti-chart-area"></i> نمودار ترافیک ساعتی</div><div class="ch-lg"><canvas id="ch3"></canvas></div></div>
 </section>
 
+<!-- CONNECTIONS -->
+<section class="pg" id="pg-connections">
+  <div class="topbar"><div><div class="tb-title"><i class="ti ti-plug-connected"></i> اتصالات</div></div><div class="tb-right"><span class="badge bg-green" id="conns-live">—</span><button class="btn btn-p btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i></button></div></div>
+  <div class="card"><div class="card-title"><i class="ti ti-list"></i> جزئیات</div><div id="conns-list"></div><div class="empty" id="conns-empty" style="display:none"><i class="ti ti-plug-off"></i><p>هیچ اتصال فعالی نیست</p></div></div>
+</section>
+
 <!-- SECURITY -->
 <section class="pg" id="pg-security">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-shield-lock"></i> امنیت</div></div></div>
@@ -910,14 +1109,21 @@ a{color:inherit;text-decoration:none}
     <div class="card">
       <div class="card-title"><i class="ti ti-lock"></i> رمزنگاری</div>
       <div class="sr"><span class="sr-k"><i class="ti ti-certificate"></i> TLS/HTTPS</span><span class="sr-v" style="color:var(--green-t)">● فعال (443)</span></div>
-      <div class="sr"><span class="sr-k"><i class="ti ti-network"></i> پروتکل‌ها</span><span class="sr-v">VLESS / Trojan / XHTTP</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-fingerprint"></i> Fingerprint</span><span class="sr-v">Chrome Spoof</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-network"></i> پروتکل</span><span class="sr-v">VLESS/WS</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-key"></i> هش رمز</span><span class="sr-v">SHA-256+Salt</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-cookie"></i> سشن</span><span class="sr-v">HttpOnly · 7 روز</span></div>
     </div>
     <div class="card">
       <div class="card-title"><i class="ti ti-shield-check"></i> کنترل دسترسی</div>
-      <div class="sr"><span class="sr-k"><i class="ti ti-id-badge"></i> اتصالات زنده</span><span class="sr-v" style="color:var(--green-t)">● پایش مداوم بافر</span></div>
-      <div class="sr"><span class="sr-k"><i class="ti ti-ban"></i> قطع خودکار سهمیه</span><span class="sr-v" style="color:var(--green-t)">● فعال آنی v9.0</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-id-badge"></i> UUID Auth سخت‌گیرانه</span><span class="sr-v" style="color:var(--green-t)">● فعال v8.1</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-toggle-right"></i> فعال/غیرفعال لینک</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-gauge"></i> سهمیه ترافیک</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-calendar-x"></i> تاریخ انقضا</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-ban"></i> قطع خودکار</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
     </div>
   </div>
+  <div class="cl"><i class="ti ti-info-circle"></i><span>در v8.1 هر UUID ناشناخته، حذف‌شده یا غیرفعال قبل از accept پروتکل VLESS رد می‌شود. اتصال بلافاصله با کد 1008 قطع می‌گردد.</span></div>
 </section>
 
 <!-- ERRORS -->
@@ -930,8 +1136,32 @@ a{color:inherit;text-decoration:none}
 <section class="pg" id="pg-ideas">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-bulb"></i> ایده‌ها</div></div></div>
   <div class="idea-grid">
-    <div class="idea-card"><div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-shield-check"></i></div><div class="idea-title">Active Kill Session</div><div class="idea-desc">قطع آنی اتصالات فعال به محض اتمام سهمیه حجم یا انقضای زمان.</div><span class="ibadge done">آماده v9.0</span></div>
-    <div class="idea-card"><div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-rocket"></i></div><div class="idea-title">پشتیبانی چند پروتکله</div><div class="idea-desc">ترکیب همزمان VLESS-WS، Trojan-WS و پروتکل نوین XHTTP در یک هسته.</div><span class="ibadge done">آماده v9.0</span></div>
+    <div class="idea-card"><div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-shield-check"></i></div><div class="idea-title">UUID Auth سخت‌گیرانه</div><div class="idea-desc">UUID ناشناخته، حذف‌شده یا غیرفعال قبل از هر پردازشی رد می‌شود.</div><span class="ibadge done">آماده v8.1</span></div>
+    <div class="idea-card"><div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-device-floppy"></i></div><div class="idea-title">ذخیره دائمی JSON</div><div class="idea-desc">اطلاعات لینک‌ها و رمز عبور روی فایل ذخیره و با restart حفظ می‌شوند.</div><span class="ibadge done">آماده v8</span></div>
+    <div class="idea-card"><div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-rocket"></i></div><div class="idea-title">Relay بهینه</div><div class="idea-desc">بافر 256KB، TCP_NODELAY، drain هوشمند و relay موازی برای حداکثر throughput.</div><span class="ibadge done">آماده v8.1</span></div>
+    <div class="idea-card"><div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-sun"></i></div><div class="idea-title">تم روشن / تاریک</div><div class="idea-desc">سویچ بین دارک و لایت مود با ذخیره خودکار تنظیم.</div><span class="ibadge done">آماده v8</span></div>
+    <div class="idea-card"><div class="idea-icon"><i class="ti ti-database"></i></div><div class="idea-title">Redis Persistence</div><div class="idea-desc">اتصال به Redis برای ذخیره‌سازی سریع‌تر و اشتراک state بین instance‌ها.</div><span class="ibadge plan">پیشنهادی</span></div>
+    <div class="idea-card"><div class="idea-icon"><i class="ti ti-brand-telegram"></i></div><div class="idea-title">اعلان تلگرامی</div><div class="idea-desc">ارسال پیام هنگام رسیدن مصرف به ۸۰٪ و ۱۰۰٪ سهمیه از طریق Bot API.</div><span class="ibadge plan">پیشنهادی</span></div>
+  </div>
+</section>
+
+<!-- TEST WS -->
+<section class="pg" id="pg-testws">
+  <div class="topbar"><div><div class="tb-title"><i class="ti ti-wifi"></i> تست WebSocket</div></div></div>
+  <div class="card" style="max-width:660px">
+    <div class="cl amber" style="margin-top:0;margin-bottom:12px"><i class="ti ti-alert-triangle"></i><span>فقط UUID‌های ثبت‌شده و فعال اتصال برقرار می‌کنند. UUID رندوم رد خواهد شد.</span></div>
+    <div class="form-row" style="margin-bottom:12px">
+      <div class="fg" style="flex:1"><label>UUID (باید در لینک‌ها وجود داشته باشد)</label><input class="fi" id="ws-uuid" placeholder="UUID یک لینک فعال را وارد کنید" style="width:100%"></div>
+      <button class="btn btn-p" onclick="wsConn()"><i class="ti ti-plug-connected"></i> اتصال</button>
+      <button class="btn btn-d" onclick="wsDisc()"><i class="ti ti-plug-x"></i> قطع</button>
+    </div>
+    <div class="form-row" style="margin-bottom:12px">
+      <input class="fi" id="ws-msg" placeholder="پیام تست..." style="flex:1">
+      <button class="btn btn-o" onclick="wsSend()"><i class="ti ti-send"></i> ارسال</button>
+    </div>
+    <div style="background:rgba(0,0,0,.3);border:1px solid var(--card-b);border-radius:10px;padding:14px;height:250px;overflow-y:auto;font-family:ui-monospace,monospace;font-size:10.5px;line-height:1.9" id="ws-log">
+      <p style="color:var(--t3)">منتظر اتصال...</p>
+    </div>
   </div>
 </section>
 
@@ -942,7 +1172,11 @@ a{color:inherit;text-decoration:none}
     <div class="card">
       <div class="card-title"><i class="ti ti-server"></i> اطلاعات سرور</div>
       <div class="sr"><span class="sr-k"><i class="ti ti-world"></i> دامنه</span><span class="sr-v" id="set-host">—</span></div>
-      <div class="sr"><span class="sr-k"><i class="ti ti-versions"></i> نسخه هسته</span><span class="sr-v">v9.0 Engine</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-route"></i> پورت</span><span class="sr-v">443 (TLS)</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-versions"></i> نسخه</span><span class="sr-v">v8.2</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-brand-fastapi"></i> فریم‌ورک</span><span class="sr-v">FastAPI + Uvicorn</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-cloud"></i> پلتفرم</span><span class="sr-v">Railway</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-device-floppy"></i> ذخیره‌سازی</span><span class="sr-v">JSON File (/data)</span></div>
     </div>
     <div class="card">
       <div class="card-title"><i class="ti ti-key"></i> تغییر رمز عبور</div>
@@ -950,6 +1184,7 @@ a{color:inherit;text-decoration:none}
       <div class="fg" style="margin-bottom:11px"><label>رمز جدید</label><input class="fi" type="password" id="cp-new" placeholder="حداقل ۴ کاراکتر" style="width:100%"></div>
       <div class="fg" style="margin-bottom:14px"><label>تکرار رمز جدید</label><input class="fi" type="password" id="cp-cf" placeholder="تکرار رمز جدید" style="width:100%"></div>
       <button class="btn btn-p" onclick="changePw()" style="width:100%;justify-content:center"><i class="ti ti-key"></i> تغییر رمز</button>
+      <div class="cl" style="margin-top:11px"><i class="ti ti-info-circle"></i><span>رمز پیش‌فرض: <b>123456</b> · پس از تغییر، سشن‌های دیگر باطل می‌شوند.</span></div>
     </div>
   </div>
 </section>
@@ -973,9 +1208,10 @@ function toast(msg,type=''){
   t.textContent=msg;t.className='toast show'+(type?' '+type:'');
   setTimeout(()=>t.classList.remove('show'),2400);
 }
-function fmtB(b){if(!b||b===0)return '0 B';if(b<1024)return b+' B';if(b<1024**2)return (b/1024).toFixed(1)+' KB';if(b<1024**2)return (b/1024**2).toFixed(2)+' MB';return (b/1024**3).toFixed(2)+' GB'}
+function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':n}
+function fmtB(b){if(!b||b===0)return '0 B';if(b<1024)return b+' B';if(b<1024**2)return (b/1024).toFixed(1)+' KB';if(b<1024**3)return (b/1024**2).toFixed(2)+' MB';return (b/1024**3).toFixed(2)+' GB'}
 function toFa(n){return n.toString().replace(/\d/g,d=>'۰۱۲۳۴۵۶۷۸۹'[d])}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&','<':'<','>':'>','"':'"',"'":''}[c]))}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function daysLeft(exp){if(!exp)return null;return Math.ceil((new Date(exp)-new Date())/(864e5))}
 function expChip(exp,expired){
   if(expired)return '<span class="exp-chip ec-exp"><i class="ti ti-calendar-x"></i> منقضی</span>';
@@ -1015,6 +1251,7 @@ function navTo(name){
   document.querySelectorAll('.nav-it').forEach(n=>n.classList.toggle('on',n.dataset.pg===name));
   document.querySelectorAll('.pg').forEach(p=>p.classList.toggle('on',p.id==='pg-'+name));
   if(name==='links')loadLinks();
+  if(name==='connections')loadConns();
   if(name==='errors')loadErrs();
   if(name==='subscriptions')loadSubs();
   closeSb();window.scrollTo({top:0,behavior:'smooth'});
@@ -1032,6 +1269,7 @@ async function fetchStats(){
   try{
     const r=await authF('/stats'),d=await r.json();
     document.getElementById('m-conns').textContent=d.active_connections;
+    document.getElementById('conns-nb').textContent=d.active_connections;
     document.getElementById('m-traffic').innerHTML=d.total_traffic_mb.toFixed(1)+'<span class="m-unit">MB</span>';
     document.getElementById('m-alinks').textContent=d.active_links??'—';
     document.getElementById('m-lsub').textContent='از '+d.links_count+' لینک';
@@ -1040,11 +1278,16 @@ async function fetchStats(){
     document.getElementById('uptime-inline').textContent=d.uptime;
     document.getElementById('uptime-badge').textContent='Railway · '+d.uptime;
     document.getElementById('last-upd').textContent='آخرین بروزرسانی: '+new Date().toLocaleTimeString('fa-IR');
+    document.getElementById('conns-live').innerHTML='<span class="dot dg pulse"></span> '+d.active_connections+' اتصال';
     document.getElementById('t-traffic').innerHTML=d.total_traffic_mb.toFixed(1)+'<span class="m-unit">MB</span>';
+    const delta=d.total_traffic_mb-prevTraf,pct=Math.min(100,Math.round((delta/50)*100));
+    document.getElementById('bw-pct').textContent=pct+'%';
+    document.getElementById('bw-bar').style.width=pct+'%';
     prevTraf=d.total_traffic_mb;
     if(d.hourly){
       const labels=Object.keys(d.hourly).sort(),vals=labels.map(k=>+(d.hourly[k]/1024**2).toFixed(2));
       [ch1,ch3].forEach(c=>{if(!c)return;c.data.labels=labels;c.data.datasets[0].data=vals;c.update()});
+      if(vals.length){const avg=vals.reduce((a,b)=>a+b,0)/vals.length,peak=Math.max(...vals);document.getElementById('t-avg').innerHTML=avg.toFixed(2)+'<span class="m-unit">MB</span>';document.getElementById('t-peak').innerHTML=peak.toFixed(2)+'<span class="m-unit">MB</span>';}
     }
     renderErrs(d.recent_errors||[]);
   }catch(e){console.error(e)}
@@ -1053,7 +1296,7 @@ async function fetchStats(){
 function renderErrs(errs){
   const el=document.getElementById('errs-full');if(!el)return;
   if(!errs.length){el.innerHTML='<div style="color:var(--green-t);padding:10px;font-size:12px;display:flex;align-items:center;gap:5px"><i class="ti ti-circle-check"></i> هیچ خطایی نیست</div>';return}
-  el.innerHTML=errs.slice().reverse().map(e=>`<div class="erow"><div class="etime"><i class="ti ti-clock"></i>${new Date(e.time).toLocaleString('fa-IR')}</div><div class="emsg">${esc(e.error)}</div></div>`).join('');
+  el.innerHTML=errs.slice().reverse().map(e=>`<div class="erow"><div class="etime"><i class="ti ti-clock"></i>${new Date(e.time).toLocaleString('fa-IR')}</div><div class="emsg">${esc(e.error)}${e.url?' — '+esc(e.url):''}</div></div>`).join('');
 }
 
 async function loadLinks(){
@@ -1069,21 +1312,21 @@ async function loadLinks(){
     tb.innerHTML=links.map(l=>{
       const lim=l.limit_bytes===0?'∞':fmtB(l.limit_bytes),pct=l.limit_bytes===0?0:Math.min(100,l.used_bytes/l.limit_bytes*100),bc=pct>90?'var(--red)':pct>70?'var(--amber)':'var(--accent)',allowed=l.active&&!l.expired;
       return `<tr>
-        <td><div class="ll">${esc(l.label)}</div><div class="lm"><span>${new Date(l.created_at).toLocaleDateString('fa-IR')}</span></div></td>
+        <td><div class="ll">${esc(l.label)}</div><div class="lm"><span>${new Date(l.created_at).toLocaleDateString('fa-IR')}</span>${l.note?`<span title="${esc(l.note)}"><i class="ti ti-note"></i>${esc(l.note.slice(0,25))}${l.note.length>25?'...':''}</span>`:''}</div></td>
         <td><span class="uuid-chip" onclick="navigator.clipboard.writeText('${l.uuid}').then(()=>toast('UUID کپی شد','ok'))" title="کلیک برای کپی">${l.uuid.slice(0,13)}…</span></td>
         <td><div style="width:120px"><div class="ubar"><div class="ubar-f" style="width:${pct}%;background:${bc}"></div></div><div class="utxt">${fmtB(l.used_bytes)} / ${lim}</div></div></td>
         <td>${expChip(l.expires_at,l.expired)}</td>
-        <td><button class="tog${allowed?' on':''}" onclick="toggleActive('${l.uuid}',${!l.active})"></button></td>
-        <td><div style="display:flex;gap:6px;flex-wrap:nowrap">
-          <button class="btn btn-sm btn-p" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک VLESS-WS کپی شد','ok'))" title="کپی VLESS WS">VLESS</button>
-          <button class="btn btn-sm btn-g" style="background:#10B981;color:white" onclick="navigator.clipboard.writeText('${esc(l.trojan_link)}').then(()=>toast('لینک Trojan-WS کپی شد','ok'))" title="کپی Trojan WS">Trojan</button>
-          <button class="btn btn-sm btn-o" style="background:#F59E0B;color:white" onclick="navigator.clipboard.writeText('${esc(l.xhttp_link)}').then(()=>toast('لینک XHTTP کپی شد','ok'))" title="کپی VLESS XHTTP">XHTTP</button>
+        <td><button class="tog${allowed?' on':''}" onclick="toggleActive('${l.uuid}',${!l.active})" title="${l.active?'غیرفعال کن':'فعال کن'}"></button></td>
+        <td><div style="display:flex;gap:4px;flex-wrap:nowrap">
+          <button class="btn btn-sm btn-g" onclick="navigator.clipboard.writeText('${esc(l.vless_link)}').then(()=>toast('لینک VLESS کپی شد','ok'))" title="کپی لینک"><i class="ti ti-copy"></i></button>
           <button class="btn btn-sm btn-g" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('لینک سابسکریپشن کپی شد','ok'))" title="کپی Sub URL"><i class="ti ti-rss"></i></button>
-          <button class="btn btn-sm btn-d" onclick="deleteLink('${l.uuid}')"><i class="ti ti-trash"></i></button>
+          <button class="btn btn-sm btn-g" onclick="window.open('https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent('${esc(l.vless_link)}'),'_blank')" title="QR"><i class="ti ti-qrcode"></i></button>
+          <button class="btn btn-sm btn-g" onclick="resetUsage('${l.uuid}')" title="ریست مصرف"><i class="ti ti-rotate"></i></button>
+          <button class="btn btn-sm btn-d" onclick="deleteLink('${l.uuid}')" title="حذف"><i class="ti ti-trash"></i></button>
         </div></td>
       </tr>`;
     }).join('');
-    document.getElementById('lsummary').innerHTML=links.slice(0,6).map(l=>`<div class="sr"><span class="sr-k"><i class="ti ti-circle-check"></i>${esc(l.label)}</span><span class="sr-v">${fmtB(l.used_bytes)} / ${l.limit_bytes===0?'∞':fmtB(l.limit_bytes)}</span></div>`).join('');
+    document.getElementById('lsummary').innerHTML=links.slice(0,6).map(l=>`<div class="sr"><span class="sr-k" style="gap:5px"><i class="ti ${l.expired?'ti-calendar-x':l.active?'ti-circle-check':'ti-circle-x'}" style="color:${l.expired?'var(--amber)':l.active?'var(--green)':'var(--red)'}"></i>${esc(l.label)}</span><span class="sr-v" style="font-size:10px">${fmtB(l.used_bytes)} / ${l.limit_bytes===0?'∞':fmtB(l.limit_bytes)}</span></div>`).join('');
   }catch(e){console.error(e)}
 }
 
@@ -1098,41 +1341,65 @@ async function createLink(){
 }
 
 async function toggleActive(uuid,newState){
-  try{const r=await authF('/api/links/'+uuid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:newState})});if(!r.ok)throw new Error();toast('تغییر وضعیت انجام شد','ok');loadLinks();}catch(e){toast('خطا','err')}
+  try{const r=await authF('/api/links/'+uuid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:newState})});if(!r.ok)throw new Error();toast(newState?'لینک فعال شد':'لینک غیرفعال شد','ok');loadLinks();}catch(e){toast('خطا در تغییر وضعیت','err')}
+}
+async function resetUsage(uuid){
+  try{const r=await authF('/api/links/'+uuid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});if(!r.ok)throw new Error();toast('مصرف ریست شد','ok');loadLinks();}catch(e){toast('خطا','err')}
 }
 async function deleteLink(uuid){
-  if(!confirm('حذف شود؟'))return;
-  try{const r=await authF('/api/links/'+uuid,{method:'DELETE'});if(!r.ok)throw new Error();toast('حذف شد','ok');loadLinks();}catch(e){toast('خطا','err')}
+  if(!confirm('آیا از حذف این لینک مطمئن هستید؟'))return;
+  try{const r=await authF('/api/links/'+uuid,{method:'DELETE'});if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'failed')}toast('لینک حذف شد','ok');loadLinks();}catch(e){toast('خطا در حذف: '+e.message,'err')}
 }
 
-async function loadErrs(){try{const r=await authF('/stats'),d=await r.json();renderErrs(d.recent_errors||[]);}catch(e){}}
-
 async function loadSubs(){
+  document.getElementById('sub-all-url').textContent=location.protocol+'//'+location.host+'/sub-all';
   try{
     const r=await authF('/api/links'),d=await r.json();
     const links=(d.links||[]).filter(l=>l.active&&!l.expired);
     const el=document.getElementById('sub-list');
     if(!links.length){el.innerHTML='<div class="empty"><i class="ti ti-rss-off"></i><p>هیچ لینک فعالی نیست</p></div>';return}
-    el.innerHTML=links.map(l=>`<div style="padding:12px 14px;background:var(--accent-d);border:1px solid var(--card-b);border-radius:9px;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><div><div style="font-weight:600;font-size:12px;margin-bottom:3px">${esc(l.label)}</div><div class="sub-url">${esc(l.sub_url)}</div></div><div style="display:flex;gap:5px"><button class="btn btn-sm btn-g" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('کپی شد','ok'))"><i class="ti ti-copy"></i> کپی</button></div></div>`).join('');
+    el.innerHTML=links.map(l=>`<div style="padding:12px 14px;background:var(--accent-d);border:1px solid var(--card-b);border-radius:9px;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><div><div style="font-weight:600;font-size:12px;margin-bottom:3px">${esc(l.label)}</div><div class="sub-url">${esc(l.sub_url)}</div></div><div style="display:flex;gap:5px"><button class="btn btn-sm btn-g" onclick="navigator.clipboard.writeText('${esc(l.sub_url)}').then(()=>toast('کپی شد','ok'))"><i class="ti ti-copy"></i> کپی</button><button class="btn btn-sm btn-g" onclick="window.open('https://api.qrserver.com/v1/create-qr-code/?size=260x260&data='+encodeURIComponent('${esc(l.sub_url)}'),'_blank')"><i class="ti ti-qrcode"></i></button></div></div>`).join('');
   }catch(e){}
 }
+function cpSubAll(){navigator.clipboard.writeText(location.protocol+'//'+location.host+'/sub-all').then(()=>toast('آدرس سابسکریپشن کپی شد','ok'))}
 
-function refreshAll(){fetchStats();loadLinks();toast('بروزرسانی شد','');if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubs()}
+async function loadConns(){
+  try{const r=await authF('/stats'),d=await r.json();const cl=document.getElementById('conns-list'),ce=document.getElementById('conns-empty');if(d.active_connections===0){cl.innerHTML='';ce.style.display='block';return}ce.style.display='none';cl.innerHTML=`<div style="padding:13px;background:var(--green-bg);border:1px solid rgba(16,185,129,.15);border-radius:9px;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--green-t)"><span class="dot dg pulse"></span>${d.active_connections} اتصال فعال · کل ${d.total_traffic_mb.toFixed(1)} MB</div>`;}catch(e){}
+}
+async function loadErrs(){try{const r=await authF('/stats'),d=await r.json();renderErrs(d.recent_errors||[]);}catch(e){}}
+
+async function fetchDefaultVless(){
+  try{const r=await authF('/api/links'),d=await r.json();const links=d.links||[];const def=links.find(l=>l.limit_bytes===0&&l.active&&!l.expired)||links.find(l=>l.active&&!l.expired)||links[0];document.getElementById('vless-main').textContent=def?def.vless_link:'هنوز لینکی وجود ندارد — یک لینک بسازید';}catch(e){}
+}
+function cpText(id){navigator.clipboard.writeText(document.getElementById(id).textContent).then(()=>toast('کپی شد','ok'))}
+function qrFor(id){const t=document.getElementById(id).textContent;window.open('https://api.qrserver.com/v1/create-qr-code/?size=280x280&data='+encodeURIComponent(t),'_blank')}
+function refreshAll(){fetchStats();fetchDefaultVless();loadLinks();toast('در حال رفرش...','');if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubs()}
+
+let ws;
+function wsLog(c,m){const l=document.getElementById('ws-log'),p=document.createElement('p');const colors={ok:'#34D399',err:'#F87171',info:'#7BAED4',sent:'#FCD34D'};p.style.color=colors[c]||'#fff';p.textContent='['+new Date().toLocaleTimeString('fa-IR')+'] '+m;l.appendChild(p);l.scrollTop=l.scrollHeight}
+function wsConn(){const u=document.getElementById('ws-uuid').value.trim();if(!u){toast('UUID یک لینک فعال را وارد کنید','err');return}const url=(location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/'+u;wsLog('info','اتصال: '+url);ws=new WebSocket(url);ws.onopen=()=>wsLog('ok','✓ متصل - UUID معتبر است');ws.onerror=()=>wsLog('err','✗ خطا - احتمالاً UUID نامعتبر یا غیرفعال');ws.onmessage=m=>wsLog('info','دریافت '+(m.data.size||m.data.length)+' byte');ws.onclose=e=>wsLog('err','قطع ('+e.code+')'+(e.code===1008?' - دسترسی رد شد':''))}
+function wsSend(){const m=document.getElementById('ws-msg').value;if(!m||!ws||ws.readyState!==1)return;ws.send(m);wsLog('sent','ارسال: '+m);document.getElementById('ws-msg').value=''}
+function wsDisc(){if(ws)ws.close()}
 
 function initCharts(){
-  const opts={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(59,130,246,.04)'}},y:{grid:{color:'rgba(59,130,246,.04)'}}}};
-  const ds={label:'MB',data:[],borderColor:'rgba(59,130,246,.8)',backgroundColor:'rgba(59,130,246,.05)',fill:true,tension:.45,borderWidth:2};
+  const opts={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:'rgba(13,27,46,.95)',borderColor:'rgba(59,130,246,.2)',borderWidth:1,titleColor:'#E8F4FF',bodyColor:'#7BAED4',callbacks:{label:v=>`${v.parsed.y.toFixed(2)} MB`}}},scales:{x:{grid:{color:'rgba(59,130,246,.04)'},ticks:{color:'#3D6B8E',font:{size:9}}},y:{grid:{color:'rgba(59,130,246,.04)'},ticks:{color:'#3D6B8E',font:{size:9},callback:v=>v+'MB'}}}};
+  const ds={label:'MB',data:[],borderColor:'rgba(59,130,246,.8)',backgroundColor:'rgba(59,130,246,.05)',fill:true,tension:.45,pointRadius:3,pointHoverRadius:5,borderWidth:2};
   ch1=new Chart(document.getElementById('ch1'),{type:'line',data:{labels:[],datasets:[{...ds}]},options:opts});
   ch3=new Chart(document.getElementById('ch3'),{type:'line',data:{labels:[],datasets:[{...ds}]},options:opts});
-  ch2=new Chart(document.getElementById('ch2'),{type:'doughnut',data:{labels:['VLESS','Trojan','XHTTP'],datasets:[{data:[50,30,20],backgroundColor:['rgba(59,130,246,.8)','rgba(16,185,129,.7)','rgba(139,92,246,.7)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%'}});
+  ch2=new Chart(document.getElementById('ch2'),{type:'doughnut',data:{labels:['VLESS/WS','HTTP Proxy','سایر'],datasets:[{data:[70,25,5],backgroundColor:['rgba(59,130,246,.8)','rgba(16,185,129,.7)','rgba(139,92,246,.7)'],borderColor:'rgba(0,0,0,0)',borderWidth:3,hoverOffset:8}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%',plugins:{legend:{position:'bottom',labels:{color:'var(--t2)',font:{size:9},padding:10,usePointStyle:true}}}}});
 }
 
 document.addEventListener('DOMContentLoaded',async()=>{
   await checkAuth();
   initCharts();
   document.getElementById('set-host').textContent=location.host;
-  fetchStats();loadLinks();
-  setInterval(fetchStats,5000);
+  document.getElementById('sub-all-url')&&(document.getElementById('sub-all-url').textContent=location.protocol+'//'+location.host+'/sub-all');
+  fetchStats();fetchDefaultVless();loadLinks();
+  setInterval(fetchStats,4000);
+  setInterval(()=>{
+    if(document.getElementById('pg-links').classList.contains('on'))loadLinks();
+    if(document.getElementById('pg-subscriptions').classList.contains('on'))loadSubs();
+  },5000);
 });
 </script>
 </body></html>"""
@@ -1147,18 +1414,12 @@ async def login_page(request: Request):
 async def dashboard(request: Request):
     if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/login")
+    await ensure_default_link()
     return HTMLResponse(content=DASHBOARD_HTML)
 
-@app.get("/", response_class=RedirectResponse)
-async def root_redirect():
-    return RedirectResponse(url="/dashboard")
-
-@app.on_event("startup")
-async def startup_event():
-    import aiofiles
-    await load_state()
-    asyncio.create_task(traffic_flusher_and_killer_loop())
+@app.get("/test-ws", response_class=HTMLResponse)
+async def test_ws_redirect():
+    return HTMLResponse(content="<script>location.href='/dashboard'</script>")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], workers=1)
+    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
