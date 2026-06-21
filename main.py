@@ -100,6 +100,7 @@ async def load_state():
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
+            import aiofiles
             async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
                 raw = await f.read()
             data = json.loads(raw)
@@ -402,7 +403,7 @@ async def list_links(_=Depends(require_auth)):
         result.append({
             "uuid": uid, **d, "expired": expired, 
             "vless_link": vless_link, "trojan_link": trojan_link, "xhttp_link": xhttp_link,
-            "sub_url": f"https://{host}/sub/{uuid}"
+            "sub_url": f"https://{host}/sub/{uid}"
         })
     return {"links": result}
 
@@ -433,7 +434,6 @@ async def subscription_single(uuid: str):
     async with LINKS_LOCK: label = LINKS[uuid]["label"]
     remark = quote(label)
     
-    # تحویل هر ۳ کانفیگ در یک سابسکریپشن کامل
     vless_ws = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=ws&host={host}&path=%2Fws%2Fvless%2F{uuid}&sni={host}&fp=chrome#WS-{remark}"
     trojan_ws = f"trojan://{uuid}@{host}:443?security=tls&type=ws&host={host}&path=%2Fws%2Ftrojan%2F{uuid}&sni={host}&fp=chrome#Trojan-{remark}"
     vless_xhttp = f"vless://{uuid}@{host}:443?encryption=none&security=tls&type=xhttp&host={host}&path=%2Fxhttp%2F{uuid}&sni={host}&mode=packet-stream#XHTTP-{remark}"
@@ -484,7 +484,40 @@ body{font-family:'Vazirmatn',sans-serif;background:var(--bg);display:flex;align-
 .brand-name{font-size:16px;font-weight:700;color:var(--text)}
 .brand-sub{font-size:11px;color:var(--dim);margin-top:2px}
 h1{font-size:21px;font-weight:700;color:var(--text);margin-bottom:5px;letter-spacing:-.02em}
-.sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
+.sub{font-size:12px;color:var(--mid);margin-bottom:24px;line-height:1.6}
+.hint{display:flex;align-items:center;gap:10px;background:rgba(59,130,246,0.07);border:1px solid rgba(59,130,246,0.15);border-radius:10px;padding:10px 14px;margin-bottom:20px}
+.hint-label{font-size:11px;color:var(--dim);flex:1}
+.hint-val{font-family:ui-monospace,monospace;font-size:14px;font-weight:700;color:var(--accent);background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.25);padding:3px 11px;border-radius:7px;cursor:pointer;transition:.15s;letter-spacing:.08em}
+.hint-val:hover{background:rgba(59,130,246,0.22)}
+.field{margin-bottom:18px}
+.field label{display:block;font-size:10.5px;font-weight:600;color:var(--mid);margin-bottom:7px;text-transform:uppercase;letter-spacing:.06em}
+.inp-wrap{position:relative}
+input[type=password]{width:100%;padding:13px 44px 13px 16px;border-radius:11px;border:1px solid var(--border);background:rgba(0,0,0,.3);color:var(--text);font-family:inherit;font-size:14px;outline:none;transition:.2s}
+input[type=password]:focus{border-color:rgba(59,130,246,.55);background:rgba(0,0,0,.4);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
+.ic{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:18px;pointer-events:none;transition:.2s}
+input:focus+.ic{color:var(--accent)}
+.err{display:none;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#F87171;align-items:center;gap:8px}
+.err.show{display:flex}
+.btn{width:100%;padding:13px;border-radius:11px;border:none;cursor:pointer;background:linear-gradient(135deg,#2563EB,#1D4ED8);color:#fff;font-family:inherit;font-size:14px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 20px rgba(37,99,235,.4);transition:.2s;position:relative;overflow:hidden}
+.btn::before{content:'';position:absolute;inset:0;background:rgba(255,255,255,.08);opacity:0;transition:.2s}
+.btn:hover::before{opacity:1}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.footer{margin-top:22px;padding-top:18px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:center;gap:8px;font-size:11px;color:var(--dim)}
+.footer a{color:var(--accent);font-weight:600;text-decoration:none;display:flex;align-items:center;gap:4px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="bg"></div><div class="grid"></div>
+<div class="orb o1"></div><div class="orb o2"></div>
+<div class="wrap">
+  <div class="card">
+    <div class="brand">
+      <div class="brand-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox"></div>
+      <div><div class="brand-name">codebox</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
+    </div>
+    <h1>ورود به پنل</h1>
+    <p class="sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
     <div class="err" id="err"><i class="ti ti-alert-circle"></i><span id="err-text"></span></div>
     <div class="hint">
       <span class="hint-label">رمز پیش‌فرض سیستم</span>
@@ -534,7 +567,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
   --bg:#060f1d;--bg2:#0a1628;--bg3:#0e1e35;
-  --card:#0d1b2e;--card-b:rgba(59,130,246,0.13);--card-b:rgba(59,130,246,0.28);
+  --card:#0d1b2e;--card-b:rgba(59,130,246,0.13);--card-bh:rgba(59,130,246,0.28);
   --accent:#3B82F6;--accent2:#60A5FA;--accent-d:rgba(59,130,246,0.12);
   --green:#10B981;--green-bg:rgba(16,185,129,0.1);--green-t:#34D399;
   --red:#EF4444;--red-bg:rgba(239,68,68,0.1);--red-t:#F87171;
@@ -780,6 +813,7 @@ a{color:inherit;text-decoration:none}
 </aside>
 <main class="main">
 
+<!-- OVERVIEW -->
 <section class="pg on" id="pg-overview">
   <div class="topbar">
     <div><div class="tb-title"><i class="ti ti-layout-dashboard"></i> داشبورد</div><div class="tb-sub" id="last-upd">در حال بارگذاری...</div></div>
@@ -814,6 +848,7 @@ a{color:inherit;text-decoration:none}
   </div>
 </section>
 
+<!-- LINKS -->
 <section class="pg" id="pg-links">
   <div class="topbar">
     <div><div class="tb-title"><i class="ti ti-link-plus"></i> مدیریت لینک‌ها</div><div class="tb-sub">ساخت و مدیریت کانفیگ با سهمیه و تاریخ انقضا</div></div>
@@ -842,6 +877,7 @@ a{color:inherit;text-decoration:none}
   </div>
 </section>
 
+<!-- SUBSCRIPTIONS -->
 <section class="pg" id="pg-subscriptions">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-rss"></i> سابسکریپشن</div><div class="tb-sub">لینک‌های اشتراک برای اپ‌های v2ray</div></div></div>
   <div class="g2">
@@ -856,6 +892,7 @@ a{color:inherit;text-decoration:none}
   </div>
 </section>
 
+<!-- TRAFFIC -->
 <section class="pg" id="pg-traffic">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-chart-area"></i> ترافیک</div></div><div class="tb-right"><button class="btn btn-p btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i></button></div></div>
   <div class="metrics" style="grid-template-columns:repeat(3,1fr)">
@@ -866,6 +903,7 @@ a{color:inherit;text-decoration:none}
   <div class="card"><div class="card-title"><i class="ti ti-chart-area"></i> نمودار ترافیک ساعتی</div><div class="ch-lg"><canvas id="ch3"></canvas></div></div>
 </section>
 
+<!-- SECURITY -->
 <section class="pg" id="pg-security">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-shield-lock"></i> امنیت</div></div></div>
   <div class="g2">
@@ -882,11 +920,13 @@ a{color:inherit;text-decoration:none}
   </div>
 </section>
 
+<!-- ERRORS -->
 <section class="pg" id="pg-errors">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-alert-triangle"></i> خطاها</div></div><div class="tb-right"><span class="badge bg-red" id="errs-badge">۰</span><button class="btn btn-p btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i></button></div></div>
   <div class="card"><div class="card-title"><i class="ti ti-bug"></i> لاگ خطاها</div><div id="errs-full">—</div></div>
 </section>
 
+<!-- IDEAS -->
 <section class="pg" id="pg-ideas">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-bulb"></i> ایده‌ها</div></div></div>
   <div class="idea-grid">
@@ -895,6 +935,7 @@ a{color:inherit;text-decoration:none}
   </div>
 </section>
 
+<!-- SETTINGS -->
 <section class="pg" id="pg-settings">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-settings"></i> تنظیمات</div></div></div>
   <div class="g2">
@@ -1063,6 +1104,8 @@ async function deleteLink(uuid){
   if(!confirm('حذف شود؟'))return;
   try{const r=await authF('/api/links/'+uuid,{method:'DELETE'});if(!r.ok)throw new Error();toast('حذف شد','ok');loadLinks();}catch(e){toast('خطا','err')}
 }
+
+async function loadErrs(){try{const r=await authF('/stats'),d=await r.json();renderErrs(d.recent_errors||[]);}catch(e){}}
 
 async function loadSubs(){
   try{
