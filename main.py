@@ -4,7 +4,6 @@ import os
 import hashlib
 import secrets
 import time
-import b64encode
 import base64
 from datetime import datetime, timedelta
 from urllib.parse import quote
